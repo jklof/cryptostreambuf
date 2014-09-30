@@ -1,0 +1,4 @@
+cryptostreambuf
+===============
+
+C++ crypto streambuffers

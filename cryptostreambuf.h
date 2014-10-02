@@ -88,6 +88,7 @@ class ocryptostreambuf : public std::streambuf
  private:
   int_type overflow(int_type ch);
   int sync();
+  bool update();
 
   // not implemented
   ocryptostreambuf(const ocryptostreambuf&);

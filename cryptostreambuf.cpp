@@ -1,18 +1,18 @@
 /*
   Copyright 2014 Janne Lof
 
-    This program is free software: you can redistribute it and/or modify
-    it under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
+  This program is free software: you can redistribute it and/or modify
+  it under the terms of the GNU General Public License as published by
+  the Free Software Foundation, either version 3 of the License, or
+  (at your option) any later version.
 
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
+  This program is distributed in the hope that it will be useful,
+  but WITHOUT ANY WARRANTY; without even the implied warranty of
+  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  GNU General Public License for more details.
 
-    You should have received a copy of the GNU General Public License
-    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+  You should have received a copy of the GNU General Public License
+  along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
 #include "cryptostreambuf.h"
@@ -21,14 +21,14 @@
 
 icryptostreambuf::icryptostreambuf(std::streambuf *in, const crypto_key& key, const crypto_iv& iv, int enc)
   :ctx(EVP_CIPHER_CTX_new()),
-  input(*in)
+   input(*in)
 {
   if (!ctx)
     return;
 
   if (1 != EVP_CipherInit_ex(ctx, EVP_aes_256_cbc(), NULL, key.data(), iv.data(), enc))
     {
-      // rudimentary error handling
+      // something went wrong, just leave ctx to NULL
       EVP_CIPHER_CTX_free(ctx);
       ctx = NULL;
     }
@@ -69,21 +69,23 @@ std::streambuf::int_type icryptostreambuf::underflow()
       // so buffer is always putback+buffer
     }
 
-  // ok, we need to fill buffer, so read from underlying buffer
-
-  // should loop until we are at an end or encrypt/decrypt returns
-  // at least some bytes, we are not worrying
-  // to fill out buffer completely
+  // read from underlying buffer,  we should loop until stream is
+  // at an end or encrypt/decrypt returns at least some bytes,
+  // but there is no need to worry about filling out buffer completely
   int out_len = 0;
   while (out_len == 0 && input.sgetc() != traits_type::eof())
     {
       int in_len = input.sgetn(in.data(), in.size());
       int outl = 0;
 
-      // TODO: error handling
-      EVP_CipherUpdate(ctx,
-			(uint8_t*)out.data()+out_len, &outl,
-			(uint8_t*)in.data(), in_len);
+      if (1 != EVP_CipherUpdate(ctx,
+				(uint8_t*)out.data()+out_len, &outl,
+				(uint8_t*)in.data(), in_len) )
+	{
+	  EVP_CIPHER_CTX_free(ctx);
+	  ctx = NULL;
+	  return traits_type::eof();
+	}
       out_len += outl;
     }
 
@@ -91,9 +93,8 @@ std::streambuf::int_type icryptostreambuf::underflow()
   if (input.sgetc() == traits_type::eof())
     {
       int outl = 0;
-      // TODO: error handling
       EVP_CipherFinal_ex(ctx, (uint8_t*)out.data()+out_len, &outl);
-      EVP_CIPHER_CTX_free(ctx); // free does EVP_CIPHER_CTX_cleanup also
+      EVP_CIPHER_CTX_free(ctx);
       ctx = NULL;
       out_len += outl;
     }
@@ -104,7 +105,7 @@ std::streambuf::int_type icryptostreambuf::underflow()
   if (out_len == 0)
     {
       return traits_type::eof();
-   }
+    }
 
   // set buffer pointers
   char *start = out.data(); // TODO: + putback_size
@@ -122,7 +123,6 @@ ocryptostreambuf::ocryptostreambuf(std::streambuf* out, const crypto_key& key, c
   if (!ctx)
     return;
 
-  // TODO: better error handling
   if (1 != EVP_CipherInit_ex(ctx, EVP_aes_256_cbc(), NULL, key.data(), iv.data(), enc))
     {
       EVP_CIPHER_CTX_free(ctx);
@@ -143,17 +143,13 @@ ocryptostreambuf::~ocryptostreambuf()
 std::streambuf::int_type ocryptostreambuf::overflow(int_type ch)
 {
   // overflow is only ever called when buffer is full
-  // i think eof never happens in normal couse of operation?
+  // i think eof never happens in normal course of operation?
   if (!ctx || ch == traits_type::eof() )
     {
       return traits_type::eof();
     }
 
-  // sync flushes and crypts buffer
-  // todo: to handle output buffer sync
-  // it would be better to have update() and
-  // sync would call update() and output.sync();
-  sync();
+  update();
 
   // append remaining char to newly empty buffer
   *pptr() = ch;  pbump(1);
@@ -161,30 +157,47 @@ std::streambuf::int_type ocryptostreambuf::overflow(int_type ch)
   return ch;
 }
 
+bool ocryptostreambuf::update()
+{
+  int inl = pptr() - pbase(); // number of bytes to input
+  pbump(-inl);
+  int outl = 0;
+  if (1 != EVP_CipherUpdate(ctx, (uint8_t*)out.data(), &outl, (uint8_t*)pbase(), inl))
+    {
+      EVP_CIPHER_CTX_free(ctx);
+      ctx = NULL;
+      return false;
+    }
+  // output to underlying stream
+  return ( output.sputn(out.data(), outl) == outl );
+}
+
+
 void ocryptostreambuf::finalize()
 {
-  sync();
+  // make sure we have updated all bytes
+  update();
+  // finalize and close crypto context
   if (ctx)
     {
       int outl = 0;
-      // TODO: error handling
-      EVP_CipherFinal_ex(ctx, (uint8_t*)out.data(), &outl);
+      if (1 == EVP_CipherFinal_ex(ctx, (uint8_t*)out.data(), &outl) )
+	{
+	  // output final bytes to underlying stream
+	  output.sputn(out.data(), outl);
+	}
       EVP_CIPHER_CTX_free(ctx);
       ctx = NULL;
-      output.sputn(out.data(), outl); // write
     }
 }
 
 
 int ocryptostreambuf::sync()
 {
-  if (!ctx)
-    return -1;
-
-  int inl = pptr() - pbase();
-  pbump(-inl);
-  int outl = 0;
-  // TODO: error handling, should sync output buffer?
-  EVP_CipherUpdate(ctx, (uint8_t*)out.data(), &outl, (uint8_t*)pbase(), inl);
-  return output.sputn(out.data(), outl) == outl ? 0 : -1;
+  if (ctx)
+    {
+      if (!update())
+	return -1;
+    }
+  return output.pubsync();
 }
